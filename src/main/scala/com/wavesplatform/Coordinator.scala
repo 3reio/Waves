@@ -2,7 +2,7 @@ package com.wavesplatform
 
 import java.util.concurrent.atomic.AtomicBoolean
 
-import com.wavesplatform.metrics.Metrics
+import com.wavesplatform.metrics.{BlockStats, Metrics}
 import com.wavesplatform.mining.Miner
 import com.wavesplatform.network.{BlockCheckpoint, Checkpoint}
 import com.wavesplatform.settings.{BlockchainSettings, WavesSettings}
@@ -30,13 +30,21 @@ object Coordinator extends ScorexLogging with Instrumented {
         def isForkValidWithCheckpoint(lastCommonHeight: Int): Boolean =
           extension.zipWithIndex.forall(p => checkpoint.isBlockValid(p._1.signerData.signature, lastCommonHeight + 1 + p._2))
 
-        def forkApplicationResultEi: Either[ValidationError, BigInt] = extension.view
-          .map(b => b -> appendBlock(checkpoint, history, blockchainUpdater, stateReader, utxStorage, time, settings.blockchainSettings)(b))
-          .collectFirst { case (b, Left(e)) => b -> e }
-          .fold[Either[ValidationError, BigInt]](Right(history.score())) {
-          case (b, e) =>
-            log.warn(s"Can't process fork starting with $lastCommonBlockId, error appending block ${b.uniqueId}: $e")
-            Left(e)
+        def forkApplicationResultEi: Either[ValidationError, BigInt] = {
+          val firstDeclined = extension.view
+            .map(b => b -> appendBlock(checkpoint, history, blockchainUpdater, stateReader, utxStorage, time, settings.blockchainSettings)(b))
+            .collectFirst { case (b, Left(e)) => b -> e }
+
+          firstDeclined.foreach {
+            case (declinedBlock, _) => extension.view.dropWhile(_ != declinedBlock).foreach(BlockStats.declined)
+          }
+
+          firstDeclined
+            .fold[Either[ValidationError, BigInt]](Right(history.score())) {
+            case (b, e) =>
+              log.warn(s"Can't process fork starting with $lastCommonBlockId, error appending block ${b.uniqueId}: $e")
+              Left(e)
+          }
         }
 
         val initalHeight = history.height()
@@ -52,6 +60,7 @@ object Coordinator extends ScorexLogging with Instrumented {
               Point
                 .measurement("rollback")
                 .addField("depth", initalHeight - commonBlockHeight)
+                .addField("txs", droppedTransactions.size)
             )
           }
           droppedTransactions.foreach(utxStorage.putIfNew)
@@ -101,6 +110,7 @@ object Coordinator extends ScorexLogging with Instrumented {
     _ <- blockConsensusValidation(history, stateReader, settings, time.correctedTime())(block)
     discardedTxs <- blockchainUpdater.processBlock(block)
   } yield {
+    BlockStats.applied(block)
     utxStorage.removeAll(block.transactionData)
     discardedTxs.foreach(utxStorage.putIfNew)
   }
